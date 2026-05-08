@@ -1,5 +1,5 @@
 import streamlit as st
-from chatbot.backend import chatbot,llm,get_all_threads,save_chat_title
+from backend import chatbot,llm,get_all_threads,save_chat_title,delete_chat
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 import uuid
 
@@ -37,6 +37,47 @@ def chat_title(thread_id, query):
     # save to the database
     save_chat_title(thread_id, title_text)
 
+@st.dialog("Delete Chat")
+def confirm_delete_dialog(thread_id):
+    title_to_delete = st.session_state['chat_threads'].get(thread_id, 'Chat')
+    st.warning(f"Are you sure you want to delete '{title_to_delete}'? This action cannot be undone.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("✓ Delete", key="confirm_delete_btn", use_container_width=True):
+            if delete_chat(thread_id):
+                st.session_state['chat_threads'].pop(thread_id, None)
+
+                # If we deleted the current chat, switch to most recent existing chat
+                if st.session_state['thread_id'] == thread_id:
+                    remaining_chats = list(st.session_state['chat_threads'].keys())
+                    if remaining_chats:
+                        # Switch to the most recent chat (last one in the dict)
+                        st.session_state['thread_id'] = remaining_chats[-1]
+                        messages = load_conversation(remaining_chats[-1])
+                        temp_messages = []
+                        for msg in messages:
+                            if isinstance(msg, HumanMessage):
+                                role='user'
+                                content = msg.content
+                            else:
+                                role='assistant'
+                                content = msg.content
+                                if isinstance(content, list) and len(content) > 0:
+                                    content = content[0].get('text', '')
+                            if content and (isinstance(content, str) and content.strip() or isinstance(content, list) and len(content) > 0):
+                                temp_messages.append({'role': role, 'content': content})
+                        st.session_state['message_history'] = temp_messages
+                    else:
+                        # Only create new chat if no chats exist
+                        reset_chat()
+                st.rerun()
+
+    with col2:
+        if st.button("✕ Cancel", key="cancel_delete_btn", use_container_width=True):
+            st.rerun()
+
+
 
 # **************************************** Session Setup ******************************
 if 'message_history' not in st.session_state:
@@ -63,7 +104,10 @@ st.sidebar.header('My Conversations')
 
 if st.session_state['chat_threads']:
   for thread_id,title in reversed(st.session_state['chat_threads'].items()):
-    if st.sidebar.button(str(title),key=str(thread_id)):
+    col1, col2 = st.sidebar.columns([4, 1])
+
+    with col1:
+      if st.button(str(title), key=str(thread_id), use_container_width=True):
         st.session_state['thread_id'] = thread_id
         messages = load_conversation(thread_id)
 
@@ -85,6 +129,10 @@ if st.session_state['chat_threads']:
                 temp_messages.append({'role': role, 'content': content})
 
         st.session_state['message_history'] = temp_messages
+
+    with col2:
+      if st.button("🗑️", key=f"delete_{thread_id}", help="Delete chat"):
+        confirm_delete_dialog(thread_id)
 else:
    st.sidebar.info("No conversations yet. Start a new chat!")
 

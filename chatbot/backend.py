@@ -251,3 +251,20 @@ def get_all_threads():
     return all_threads
 
 
+def delete_chat(thread_id):
+    """Delete a chat thread and all its associated checkpoints and messages."""
+    try:
+        # Delete from checkpointer (removes from checkpoints and writes tables)
+        checkpointer.delete_thread(str(thread_id))
+
+        # Delete from chat_titles table (custom metadata)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM chat_titles WHERE thread_id = ?', (str(thread_id),))
+        conn.commit()
+
+        print(f"Chat {thread_id} deleted successfully")
+        return True
+    except Exception as e:
+        print(f"Error deleting chat {thread_id}: {e}")
+        return False
+

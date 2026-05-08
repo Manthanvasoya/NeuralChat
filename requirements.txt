@@ -36,3 +36,6 @@ torchaudio
 
 # streamlit
 streamlit
+
+# ddgs
+ddgs
