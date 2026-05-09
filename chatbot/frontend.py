@@ -161,20 +161,49 @@ if user_input:
 
     # get the response from the chatbot and stream in to the UI token by token, while also saving the response in the message history
     with st.chat_message("assistant"):
-        def ai_only_stream():
-            for message_chunk, metadata in chatbot.stream(
+        # Add a placeholder for tool status
+        status_placeholder = st.empty()
+        message_placeholder = st.empty()
+
+        def stream_with_tool_tracking():
+            tool_display = ""
+            current_message = ""
+
+            # Stream events to capture tool calls
+            for event in chatbot.stream(
                 {"messages": [HumanMessage(content=user_input)]},
                 config=CONFIG,
-                stream_mode="messages"
+                stream_mode="values"
             ):
-                if isinstance(message_chunk, AIMessage):
-                    content = message_chunk.content
-                    if isinstance(content, list) and len(content) > 0:
-                        text = content[0].get('text', '')
-                        if text.strip():
-                            yield text
+                # Check if there are tool calls being made
+                if 'messages' in event:
+                    messages = event['messages']
+                    if messages and hasattr(messages[-1], 'tool_calls'):
+                        tool_calls = messages[-1].tool_calls
+                        if tool_calls:
+                            for tool_call in tool_calls:
+                                tool_name = tool_call.get('name', 'Unknown Tool')
+                                tool_display = f"🔧 Using tool: **{tool_name}**..."
+                                status_placeholder.info(tool_display)
 
-        ai_message = st.write_stream(ai_only_stream())
+                    # Get the latest message content
+                    if messages and isinstance(messages[-1], AIMessage):
+                        content = messages[-1].content
+                        if isinstance(content, str) and content.strip():
+                            current_message = content
+                            status_placeholder.empty()
+                            message_placeholder.write(current_message)
+                        elif isinstance(content, list) and len(content) > 0:
+                            text = content[0].get('text', '')
+                            if text.strip():
+                                current_message = text
+                                status_placeholder.empty()
+                                message_placeholder.write(current_message)
+
+            status_placeholder.empty()
+            return current_message
+
+        ai_message = stream_with_tool_tracking()
 
     st.session_state['message_history'].append({'role': 'assistant', 'content': ai_message})
     if should_rerun:
