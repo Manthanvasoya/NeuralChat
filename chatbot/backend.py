@@ -18,16 +18,42 @@ from langsmith import traceable
 
 # imports for tools
 from langchain_core.tools import tool
-from langchain_community.tools import DuckDuckGoSearchRun 
+from langchain_community.tools import DuckDuckGoSearchRun
 from langgraph.prebuilt import ToolNode,tools_condition
 import requests
 
+# RAG & PDF Processing
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.documents import Document
+import faiss
+import pickle
+import os
+from pathlib import Path
+import numpy as np
+
 load_dotenv()
+
+# RAG Configuration
+FAISS_BASE_PATH = Path("faiss_indices")
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 300
+TOP_K_CHUNKS = 3
+
+# Ensure faiss_indices directory exists
+FAISS_BASE_PATH.mkdir(exist_ok=True)
+
+# Initialize embeddings model
+embeddings_model = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2")
 
 # Dedicated async loop for backend tasks
 _ASYNC_LOOP = asyncio.new_event_loop()
 _ASYNC_THREAD = threading.Thread(target=_ASYNC_LOOP.run_forever, daemon=True)
 _ASYNC_THREAD.start()
+
+# Global context to store current thread_id for tool access
+_CURRENT_THREAD_ID = None
 
 
 def _submit_async(coro):
@@ -64,9 +90,10 @@ class ChatState(TypedDict):
 def chat_node(state: ChatState):
     messages = state['messages']
     system_instruction = SystemMessage(
-        content="You have access to internet search tools. Use them ONLY for: "
+        content="You have access to internet search tools and uploaded documents. Use them ONLY for: "
                 "1) Current events or recent news (last few months), "
-                "2) Information that changes frequently. "
+                "2) Information that changes frequently, "
+                "3) Questions about uploaded documents - use retrieve_from_documents tool to search PDFs. "
                 "use get_stock_price tool when user asks for stock prices. "
                 "For general knowledge questions (history, basic facts, definitions), answer directly from your training data without using search tools."
     )
@@ -150,12 +177,7 @@ def get_stock_price(symbol: str) -> dict:
     """
     url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey=MJ6H4KHTJOGKWZZP"
     r = requests.get(url)
-    return r.json()     
-
-# binding tools with llm and defining the tool node
-tools = [search_internet, calculator, get_stock_price]
-llm = llm.bind_tools(tools)
-tool_node = ToolNode(tools)
+    return r.json()
 
 # making connection
 conn = sqlite3.connect(database='mydatabase.db',check_same_thread=False)
@@ -179,19 +201,8 @@ init_database()
 # Checkpointer
 checkpointer = SqliteSaver(conn = conn)
 
-# defining the graph
-graph = StateGraph(ChatState)
 
-# defining the nodes and edges
-graph.add_node("chat_node", chat_node)
-graph.add_node("tools", tool_node)
-
-graph.add_edge(START, "chat_node")
-graph.add_conditional_edges('chat_node',tools_condition)
-graph.add_edge('tools', 'chat_node')
-
-chatbot = graph.compile(checkpointer=checkpointer)
-
+# all the helper functions for database operations
 
 # Save chat title to database
 def save_chat_title(thread_id, title):
@@ -267,4 +278,184 @@ def delete_chat(thread_id):
     except Exception as e:
         print(f"Error deleting chat {thread_id}: {e}")
         return False
+
+
+# ======================= RAG Functions =======================
+
+def get_faiss_path(thread_id):
+    """Get the FAISS index directory path for a specific thread."""
+    return FAISS_BASE_PATH / str(thread_id)
+
+def get_faiss_index_file(thread_id):
+    """Get the full path to FAISS index file."""
+    return get_faiss_path(thread_id) / "index.faiss"
+
+def get_faiss_metadata_file(thread_id):
+    """Get the full path to metadata file."""
+    return get_faiss_path(thread_id) / "metadata.pkl"
+
+
+def process_pdf_for_thread(pdf_path, thread_id, filename):
+    """
+    Process PDF file: extract text, split into chunks, generate embeddings.
+    Store FAISS index and metadata for the thread.
+    """
+    try:
+        # 1. Load PDF
+        loader = PyPDFLoader(pdf_path)
+        documents = loader.load()
+
+        if not documents:
+            return {"status": "error", "message": "No text found in PDF"}
+
+        # 2. Split into chunks with overlap
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            separators=["\n\n", "\n", " ", ""]
+        )
+
+        chunks = text_splitter.split_documents(documents)
+
+        if not chunks:
+            return {"status": "error", "message": "Could not split PDF into chunks"}
+
+        # 3. Add metadata to each chunk
+        for i, chunk in enumerate(chunks):
+            chunk.metadata['filename'] = filename
+            chunk.metadata['chunk_id'] = i
+            chunk.metadata['thread_id'] = str(thread_id)
+
+        # 4. Generate embeddings and create FAISS index
+        chunk_texts = [chunk.page_content for chunk in chunks]
+        embeddings = embeddings_model.embed_documents(chunk_texts)
+
+        # Create FAISS index
+        dimension = len(embeddings[0])
+        index = faiss.IndexFlatL2(dimension)
+
+        embeddings_array = np.array(embeddings).astype('float32')
+        index.add(embeddings_array)
+
+        # 5. Save FAISS index and metadata
+        thread_path = get_faiss_path(thread_id)
+        thread_path.mkdir(exist_ok=True)
+
+        faiss.write_index(index, str(get_faiss_index_file(thread_id)))
+
+        # Save metadata
+        metadata = {
+            'chunks': [chunk.page_content for chunk in chunks],
+            'metadata': [chunk.metadata for chunk in chunks],
+            'filenames': [filename]
+        }
+
+        with open(get_faiss_metadata_file(thread_id), 'wb') as f:
+            pickle.dump(metadata, f)
+
+        return {
+            "status": "success",
+            "message": f"Processed {filename} with {len(chunks)} chunks",
+            "chunk_count": len(chunks)
+        }
+
+    except Exception as e:
+        return {"status": "error", "message": f"Error processing PDF: {str(e)}"}
+
+
+def load_faiss_for_thread(thread_id):
+    """
+    Load FAISS index and metadata for a specific thread.
+    Returns: tuple (index, metadata) or (None, None) if not found
+    """
+    try:
+        index_path = get_faiss_index_file(thread_id)
+        metadata_path = get_faiss_metadata_file(thread_id)
+
+        if not index_path.exists() or not metadata_path.exists():
+            return None, None
+
+        index = faiss.read_index(str(index_path))
+
+        with open(metadata_path, 'rb') as f:
+            metadata = pickle.load(f)
+
+        return index, metadata
+
+    except Exception as e:
+        print(f"Error loading FAISS for thread {thread_id}: {str(e)}")
+        return None, None
+
+
+
+# tool for retrieving information from uploaded documents using FAISS search
+@tool
+def retrieve_from_documents(query: str, thread_id: str = None) -> str:
+    """
+    Search uploaded documents for relevant information using semantic similarity.
+    Use this tool to find information from PDFs uploaded to the conversation.
+    """
+    global _CURRENT_THREAD_ID
+
+    # Use provided thread_id or fallback to global context
+    current_thread = thread_id or _CURRENT_THREAD_ID
+    if not current_thread:
+        return "Error: No thread context available. Please start a conversation first."
+
+    try:
+        # Load FAISS index for this thread
+        index, metadata = load_faiss_for_thread(current_thread)
+
+        if index is None or metadata is None:
+            return "No documents uploaded for this conversation yet. Please upload a PDF first."
+
+        # Generate embedding for the query
+        query_embedding = embeddings_model.embed_query(query)
+
+        # Search similar chunks
+        query_array = np.array([query_embedding]).astype('float32')
+        distances, indices = index.search(query_array, TOP_K_CHUNKS)
+
+        if len(indices[0]) == 0:
+            return "No relevant documents found for your query."
+
+        # Format results
+        results = []
+        for idx in indices[0]:
+            if idx < len(metadata['chunks']):
+                chunk_text = metadata['chunks'][idx]
+                chunk_meta = metadata['metadata'][idx]
+                filename = chunk_meta.get('filename', 'Unknown')
+
+                results.append(
+                    f"**From {filename}:**\n{chunk_text}\n"
+                )
+
+        formatted_results = "\n---\n".join(results)
+        return f"Found relevant information:\n\n{formatted_results}"
+
+    except Exception as e:
+        return f"Error retrieving documents: {str(e)}"
+
+
+
+# ======================= Tool Binding =======================
+# Bind all tools to LLM and create tool node
+tools = [search_internet, calculator, get_stock_price, retrieve_from_documents]
+llm = llm.bind_tools(tools)
+tool_node = ToolNode(tools)
+
+# ======================= Define Graph =======================
+# Now that all tools are bound, define the graph
+graph = StateGraph(ChatState)
+
+# defining the nodes and edges
+graph.add_node("chat_node", chat_node)
+graph.add_node("tools", tool_node)
+
+graph.add_edge(START, "chat_node")
+graph.add_conditional_edges('chat_node',tools_condition)
+graph.add_edge('tools', 'chat_node')
+
+chatbot = graph.compile(checkpointer=checkpointer)
 

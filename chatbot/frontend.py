@@ -1,8 +1,14 @@
 import streamlit as st
-from backend import chatbot,llm,get_all_threads,save_chat_title,delete_chat
+from backend import (
+    chatbot, llm, get_all_threads, save_chat_title, delete_chat,
+    process_pdf_for_thread, load_faiss_for_thread, retrieve_from_documents,
+    _CURRENT_THREAD_ID
+)
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 import uuid
-
+import os
+import tempfile
+import backend
 # **************************************** utility functions *************************
 
 def generate_thread_id():
@@ -29,7 +35,15 @@ def load_conversation(thread_id):
 
 def chat_title(thread_id, query):
     title = llm.invoke(f'Generate a concise title for this conversation: {query}')
-    title_text =  title.content[0].get('text','')
+
+    # Handle different response formats
+    if isinstance(title.content, str):
+        title_text = title.content
+    elif isinstance(title.content, list) and len(title.content) > 0:
+        first = title.content[0]
+        title_text = first.get('text', '') if isinstance(first, dict) else str(first)
+    else:
+        title_text = 'Chat'
 
     # save to the session state
     st.session_state['chat_threads'][thread_id] = title_text
@@ -100,6 +114,39 @@ st.sidebar.title('SurAI')
 if st.sidebar.button('New Chat'):
     reset_chat()
 
+st.sidebar.divider()
+st.sidebar.subheader("📄 Document Upload")
+
+uploaded_file = st.sidebar.file_uploader(
+    "Upload PDF for this chat",
+    type="pdf",
+    key=f"pdf_upload_{st.session_state['thread_id']}"
+)
+
+if uploaded_file:
+    with st.sidebar.status("Processing PDF...", expanded=True) as status:
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(uploaded_file.getbuffer())
+            tmp_path = tmp_file.name
+
+        # Process PDF
+        result = process_pdf_for_thread(
+            tmp_path,
+            st.session_state['thread_id'],
+            uploaded_file.name
+        )
+
+        if result['status'] == 'success':
+            status.update(label="✅ PDF processed!", state="complete")
+            st.sidebar.success(f"✅ {result['message']}")
+        else:
+            status.update(label="❌ Error processing PDF", state="error")
+            st.sidebar.error(f"❌ {result['message']}")
+
+        # Clean up temp file
+        os.remove(tmp_path)
+
 st.sidebar.header('My Conversations')
 
 if st.session_state['chat_threads']:
@@ -166,6 +213,9 @@ if user_input:
         message_placeholder = st.empty()
 
         def stream_with_tool_tracking():
+            # Set the global thread_id for tool access
+            backend._CURRENT_THREAD_ID = st.session_state['thread_id']
+
             tool_display = ""
             current_message = ""
 

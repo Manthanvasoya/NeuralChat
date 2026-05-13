@@ -39,3 +39,8 @@ streamlit
 
 # ddgs
 ddgs
+
+# RAG & Vector Search
+faiss-cpu
+langchain-text-splitters
+pypdf
