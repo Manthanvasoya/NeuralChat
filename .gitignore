@@ -43,6 +43,9 @@ wheels/
 # Database
 *.db
 mydatabase.db
+*.db-shm
+*.db-wal
+mydatabase_*.db
 
 # Testing
 .pytest_cache/

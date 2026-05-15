@@ -184,6 +184,7 @@ conn = sqlite3.connect(database='mydatabase.db',check_same_thread=False)
 
 # Create chat_titles table FIRST - before anything else
 def init_database():
+    """Initialize only the chat_titles table. LangGraph's SqliteSaver handles checkpoints & writes."""
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS chat_titles (
