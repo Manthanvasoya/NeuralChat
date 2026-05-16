@@ -143,36 +143,54 @@ Summary:"""
 
 def prepare_messages_with_trimming(messages: list[BaseMessage]) -> list[BaseMessage]:
     """
-    Trim old messages and replace with a summary.
+    Trim old messages and replace with a summary while respecting Gemini's message ordering.
+
+    Gemini requires: User -> Assistant (with tool) -> Tool Result -> (can insert here)
 
     Returns:
         - If <= KEEP_RECENT_MESSAGES: return all as-is
-        - If > KEEP_RECENT_MESSAGES: return summary + last messages
-        - If tools are used: skip summarization (Gemini requires strict message ordering)
+        - If > KEEP_RECENT_MESSAGES:
+          - Summarize old messages
+          - Insert summary after last ToolMessage (respects tool sequence)
+          - Append last KEEP_RECENT_MESSAGES messages
     """
     if len(messages) <= KEEP_RECENT_MESSAGES:
         return messages
 
-    # Check if any ToolMessages exist (tools are being used)
     from langchain_core.messages import ToolMessage
-    has_tool_messages = any(isinstance(msg, ToolMessage) for msg in messages)
 
-    if has_tool_messages:
-        # Skip summarization when tools are used - Gemini requires strict message ordering
-        # Just return recent messages to maintain tool call sequence
-        return messages[-KEEP_RECENT_MESSAGES:]
+    old_messages = messages[:-KEEP_RECENT_MESSAGES]
+    recent_messages = messages[-KEEP_RECENT_MESSAGES:]
 
-    # Create summary of old messages (only when tools aren't involved)
+    # Create summary of old messages
     summary_text = summarize_messages(messages)
 
-    if summary_text:
-        # Create summary as HumanMessage (not SystemMessage) to respect Gemini's ordering
-        summary_msg = HumanMessage(content=summary_text)
-        recent_messages = messages[-KEEP_RECENT_MESSAGES:]
-        return [summary_msg] + recent_messages
-    else:
+    if not summary_text:
         # If summary fails, just return recent messages
-        return messages[-KEEP_RECENT_MESSAGES:]
+        return recent_messages
+
+    # Find the last ToolMessage in old messages to place summary after it
+    last_tool_idx = -1
+    for i in range(len(old_messages) - 1, -1, -1):
+        if isinstance(old_messages[i], ToolMessage):
+            last_tool_idx = i
+            break
+
+    # Build the result with proper ordering
+    if last_tool_idx >= 0:
+        # Tool messages exist: keep part up to last tool, insert summary, then add recent messages
+        summary_msg = HumanMessage(content=summary_text)
+        result = (
+            old_messages[:last_tool_idx + 1] +  # Messages up to and including last ToolMessage
+            [summary_msg] +                      # Insert summary here (respects ordering)
+            recent_messages                      # Recent messages (without old messages between)
+        )
+    else:
+        # No tool messages: prepend summary before recent messages
+        summary_msg = HumanMessage(content=summary_text)
+        result = [summary_msg] + recent_messages
+
+    return result
 
 
 # state of the workflow
