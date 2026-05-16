@@ -161,7 +161,7 @@ keep_recent = st.sidebar.slider(
 )
 
 # Update backend setting
-from chatbot.backend import set_keep_recent
+from backend import set_keep_recent
 set_keep_recent(keep_recent)
 
 st.sidebar.divider()
