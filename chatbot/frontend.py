@@ -147,6 +147,24 @@ if uploaded_file:
         # Clean up temp file
         os.remove(tmp_path)
 
+st.sidebar.divider()
+st.sidebar.subheader("⚙️ Chat Settings")
+
+# Control for keeping recent messages in long conversations
+keep_recent = st.sidebar.slider(
+    "Keep recent messages:",
+    min_value=5,
+    max_value=50,
+    value=12,
+    step=1,
+    help="Only these recent messages are sent to the LLM. Older messages are summarized for context. Adjust for longer/shorter context window."
+)
+
+# Update backend setting
+from chatbot.backend import set_keep_recent
+set_keep_recent(keep_recent)
+
+st.sidebar.divider()
 st.sidebar.header('My Conversations')
 
 if st.session_state['chat_threads']:

@@ -83,12 +83,98 @@ llm = ChatHuggingFace(llm = model)
 '''
 
 
+# ======================= Chat History Management =======================
+# Global setting for how many recent messages to keep
+KEEP_RECENT_MESSAGES = 12
+
+def set_keep_recent(count: int):
+    """Set the number of recent messages to keep (for UI slider)"""
+    global KEEP_RECENT_MESSAGES
+    KEEP_RECENT_MESSAGES = max(5, min(50, count))  # Clamp between 5-50
+
+def summarize_messages(messages: list[BaseMessage]) -> str:
+    """Create a concise summary of older messages for context."""
+    if len(messages) <= KEEP_RECENT_MESSAGES:
+        return ""
+
+    old_messages = messages[:-KEEP_RECENT_MESSAGES]
+    summary_text = "Previous conversation summary:\n"
+
+    # Extract text from old messages, filtering empty ones
+    message_contents = []
+    for msg in old_messages:
+        content = msg.content
+        if isinstance(content, str) and content.strip():
+            role = "User" if isinstance(msg, HumanMessage) else "Assistant"
+            message_contents.append(f"{role}: {content}")
+        elif isinstance(content, list) and len(content) > 0:
+            # Handle list format from Gemini
+            text = content[0].get('text', '') if isinstance(content[0], dict) else str(content[0])
+            if text.strip():
+                role = "User" if isinstance(msg, HumanMessage) else "Assistant"
+                message_contents.append(f"{role}: {text}")
+
+    if not message_contents:
+        return ""
+
+    # Create concise summary
+    summary_input = "\n".join(message_contents)
+    summary_prompt = f"""Summarize the following conversation history in 2-3 sentences, preserving key facts and decisions:
+
+{summary_input}
+
+Summary:"""
+
+    try:
+        summary = llm.invoke(summary_prompt)
+        # Handle both string and list formats from different LLMs
+        if hasattr(summary, 'content'):
+            content = summary.content
+            if isinstance(content, list) and len(content) > 0:
+                content = content[0].get('text', '') if isinstance(content[0], dict) else str(content[0])
+            summary_text += str(content)
+        else:
+            summary_text += str(summary)
+        return summary_text
+    except Exception as e:
+        print(f"[WARN] Failed to summarize: {e}")
+        return ""
+
+
+def prepare_messages_with_trimming(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """
+    Trim old messages and replace with a summary.
+
+    Returns:
+        - If <= KEEP_RECENT_MESSAGES: return all as-is
+        - If > KEEP_RECENT_MESSAGES: return [SystemMessage(summary)] + last messages
+    """
+    if len(messages) <= KEEP_RECENT_MESSAGES:
+        return messages
+
+    # Create summary of old messages
+    summary_text = summarize_messages(messages)
+
+    if summary_text:
+        # Create summary message and append recent messages
+        summary_msg = SystemMessage(content=summary_text)
+        recent_messages = messages[-KEEP_RECENT_MESSAGES:]
+        return [summary_msg] + recent_messages
+    else:
+        # If summary fails, just return recent messages
+        return messages[-KEEP_RECENT_MESSAGES:]
+
+
 # state of the workflow
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
 def chat_node(state: ChatState):
     messages = state['messages']
+
+    # Apply message trimming and summarization
+    trimmed_messages = prepare_messages_with_trimming(messages)
+
     system_instruction = SystemMessage(
         content="You have access to internet search tools and uploaded documents. Use them ONLY for: "
                 "1) Current events or recent news (last few months), "
@@ -97,7 +183,7 @@ def chat_node(state: ChatState):
                 "use get_stock_price tool when user asks for stock prices. "
                 "For general knowledge questions (history, basic facts, definitions), answer directly from your training data without using search tools."
     )
-    messages_with_system = [system_instruction] + messages
+    messages_with_system = [system_instruction] + trimmed_messages
     response = llm.invoke(messages_with_system)
     return {"messages": [response]}
 
