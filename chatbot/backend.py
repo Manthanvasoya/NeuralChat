@@ -147,17 +147,27 @@ def prepare_messages_with_trimming(messages: list[BaseMessage]) -> list[BaseMess
 
     Returns:
         - If <= KEEP_RECENT_MESSAGES: return all as-is
-        - If > KEEP_RECENT_MESSAGES: return [SystemMessage(summary)] + last messages
+        - If > KEEP_RECENT_MESSAGES: return summary + last messages
+        - If tools are used: skip summarization (Gemini requires strict message ordering)
     """
     if len(messages) <= KEEP_RECENT_MESSAGES:
         return messages
 
-    # Create summary of old messages
+    # Check if any ToolMessages exist (tools are being used)
+    from langchain_core.messages import ToolMessage
+    has_tool_messages = any(isinstance(msg, ToolMessage) for msg in messages)
+
+    if has_tool_messages:
+        # Skip summarization when tools are used - Gemini requires strict message ordering
+        # Just return recent messages to maintain tool call sequence
+        return messages[-KEEP_RECENT_MESSAGES:]
+
+    # Create summary of old messages (only when tools aren't involved)
     summary_text = summarize_messages(messages)
 
     if summary_text:
-        # Create summary message and append recent messages
-        summary_msg = SystemMessage(content=summary_text)
+        # Create summary as HumanMessage (not SystemMessage) to respect Gemini's ordering
+        summary_msg = HumanMessage(content=summary_text)
         recent_messages = messages[-KEEP_RECENT_MESSAGES:]
         return [summary_msg] + recent_messages
     else:
