@@ -47,6 +47,13 @@ FAISS_BASE_PATH.mkdir(exist_ok=True)
 # Initialize embeddings model
 embeddings_model = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2")
 
+# User Memory Configuration
+USER_MEMORY_PATH = FAISS_BASE_PATH / "user_memory"
+USER_MEMORY_PATH.mkdir(exist_ok=True)
+USER_MEMORY_INDEX_FILE = USER_MEMORY_PATH / "user_memory.faiss"
+USER_MEMORY_METADATA_FILE = USER_MEMORY_PATH / "user_memory_metadata.pkl"
+TOP_K_MEMORIES = 5  # Retrieve top 5 similar memories
+
 # Dedicated async loop for backend tasks
 _ASYNC_LOOP = asyncio.new_event_loop()
 _ASYNC_THREAD = threading.Thread(target=_ASYNC_LOOP.run_forever, daemon=True)
@@ -203,14 +210,24 @@ def chat_node(state: ChatState):
     # Apply message trimming and summarization
     trimmed_messages = prepare_messages_with_trimming(messages)
 
-    system_instruction = SystemMessage(
-        content="You have access to internet search tools and uploaded documents. Use them ONLY for: "
-                "1) Current events or recent news (last few months), "
-                "2) Information that changes frequently, "
-                "3) Questions about uploaded documents - use retrieve_from_documents tool to search PDFs. "
-                "use get_stock_price tool when user asks for stock prices. "
-                "For general knowledge questions (history, basic facts, definitions), answer directly from your training data without using search tools."
-    )
+    # Build system instruction
+    system_content = ("You have access to internet search tools and uploaded documents. Use them ONLY for: "
+                     "1) Current events or recent news (last few months), "
+                     "2) Information that changes frequently, "
+                     "3) Questions about uploaded documents - use retrieve_from_documents tool to search PDFs. "
+                     "use get_stock_price tool when user asks for stock prices. "
+                     "For general knowledge questions (history, basic facts, definitions), answer directly from your training data without using search tools.")
+
+    # Inject user memory context if available
+    try:
+        if _CURRENT_THREAD_ID:
+            memory_context = get_memory_context(_CURRENT_THREAD_ID)
+            if memory_context:
+                system_content += "\n\nUser Profile (remember these facts about the user):\n" + memory_context
+    except Exception as e:
+        print(f"[WARN] Could not inject user memories: {e}")
+
+    system_instruction = SystemMessage(content=system_content)
     messages_with_system = [system_instruction] + trimmed_messages
     response = llm.invoke(messages_with_system)
     return {"messages": [response]}
@@ -313,6 +330,27 @@ def init_database():
 # Initialize database immediately
 init_database()
 
+# Initialize user memory table (for long-term memory)
+def init_user_memory_table():
+    """Initialize user_memory table for storing user facts and preferences"""
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_memory (
+            memory_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            memory_type TEXT NOT NULL,
+            memory_content TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            importance_score FLOAT DEFAULT 0.5,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    print("User memory table initialized successfully")
+
+init_user_memory_table()
+
 # Checkpointer
 checkpointer = SqliteSaver(conn = conn)
 
@@ -393,6 +431,126 @@ def delete_chat(thread_id):
     except Exception as e:
         print(f"Error deleting chat {thread_id}: {e}")
         return False
+
+
+# ======================= User Memory Functions =======================
+
+def add_user_memory(user_id, memory_type, memory_content):
+    """Store a user memory fact with embedding"""
+    try:
+        # Generate embedding for the memory content
+        embedding = embeddings_model.embed_query(memory_content)
+        embedding_bytes = np.array(embedding, dtype='float32').tobytes()
+
+        # Store in database
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO user_memory (user_id, memory_type, memory_content, embedding)
+            VALUES (?, ?, ?, ?)
+        ''', (str(user_id), memory_type, memory_content, embedding_bytes))
+        conn.commit()
+
+        # Update FAISS index
+        _update_user_memory_index(user_id)
+
+        return True
+    except Exception as e:
+        print(f"[WARN] Error adding user memory: {e}")
+        return False
+
+
+def _update_user_memory_index(user_id):
+    """Rebuild FAISS index for all user memories"""
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT memory_id, memory_content, embedding FROM user_memory
+            WHERE user_id = ?
+        ''', (str(user_id),))
+        results = cursor.fetchall()
+
+        if not results:
+            return
+
+        # Create FAISS index
+        embeddings_list = []
+        metadata_list = []
+
+        for memory_id, content, embedding_bytes in results:
+            embedding = np.frombuffer(embedding_bytes, dtype='float32').astype('float32')
+            embeddings_list.append(embedding)
+            metadata_list.append({'memory_id': memory_id, 'content': content})
+
+        if embeddings_list:
+            embeddings_array = np.array(embeddings_list).astype('float32')
+            index = faiss.IndexFlatL2(embeddings_array.shape[1])
+            index.add(embeddings_array)
+
+            # Save index and metadata
+            faiss.write_index(index, str(USER_MEMORY_INDEX_FILE))
+            with open(USER_MEMORY_METADATA_FILE, 'wb') as f:
+                pickle.dump({'user_id': user_id, 'metadata': metadata_list}, f)
+    except Exception as e:
+        print(f"[WARN] Error updating user memory index: {e}")
+
+
+def retrieve_user_memories(user_id, query, top_k=5):
+    """Retrieve most relevant user memories by semantic similarity"""
+    try:
+        # Check if FAISS index exists
+        if not USER_MEMORY_INDEX_FILE.exists():
+            return []
+
+        # Load FAISS index and metadata
+        index = faiss.read_index(str(USER_MEMORY_INDEX_FILE))
+        with open(USER_MEMORY_METADATA_FILE, 'rb') as f:
+            data = pickle.load(f)
+
+        # Check if this is the right user
+        if data.get('user_id') != str(user_id):
+            return []
+
+        # Generate query embedding
+        query_embedding = embeddings_model.embed_query(query)
+        query_array = np.array([query_embedding], dtype='float32')
+
+        # Search similar memories
+        distances, indices = index.search(query_array, min(top_k, len(data['metadata'])))
+
+        memories = []
+        for idx in indices[0]:
+            if idx < len(data['metadata']):
+                memories.append(data['metadata'][idx]['content'])
+
+        return memories
+    except Exception as e:
+        print(f"[WARN] Error retrieving user memories: {e}")
+        return []
+
+
+def get_memory_context(user_id):
+    """Get formatted context string of user memories for injection"""
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT memory_type, memory_content FROM user_memory
+            WHERE user_id = ?
+            ORDER BY importance_score DESC, created_at DESC
+            LIMIT 5
+        ''', (str(user_id),))
+        results = cursor.fetchall()
+
+        if not results:
+            return ""
+
+        memory_lines = []
+        for mem_type, content in results:
+            memory_lines.append(f"• {mem_type}: {content}")
+
+        return "\n".join(memory_lines)
+    except Exception as e:
+        print(f"[WARN] Error getting memory context: {e}")
+        return ""
 
 
 # ======================= RAG Functions =======================
