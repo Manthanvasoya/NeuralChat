@@ -9,7 +9,42 @@ import uuid
 import os
 import tempfile
 import backend
+import json
+from pathlib import Path
+
 # **************************************** utility functions *************************
+
+def get_or_create_user_id():
+    """
+    Get a persistent user ID that survives page refreshes.
+    Stored in a hidden file in the app directory.
+    """
+    user_id_file = Path(".streamlit/.user_id")
+
+    # Create directory if it doesn't exist
+    user_id_file.parent.mkdir(exist_ok=True)
+
+    # Load existing user_id if it exists
+    if user_id_file.exists():
+        try:
+            with open(user_id_file, 'r') as f:
+                user_id = f.read().strip()
+                if user_id:
+                    print(f"[INFO] Loaded persistent user_id: {user_id}")
+                    return user_id
+        except Exception as e:
+            print(f"[WARN] Error loading user_id: {e}")
+
+    # Create new user_id
+    user_id = str(uuid.uuid4())
+    try:
+        with open(user_id_file, 'w') as f:
+            f.write(user_id)
+        print(f"[INFO] Created new persistent user_id: {user_id}")
+    except Exception as e:
+        print(f"[WARN] Error saving user_id: {e}")
+
+    return user_id
 
 def generate_thread_id():
     thread_id = uuid.uuid4()
@@ -96,6 +131,11 @@ def confirm_delete_dialog(thread_id):
 # **************************************** Session Setup ******************************
 if 'message_history' not in st.session_state:
     st.session_state['message_history'] = []
+
+# Create or load persistent user ID from file (survives page refresh!)
+if 'user_id' not in st.session_state:
+    st.session_state['user_id'] = get_or_create_user_id()
+    print(f"[INFO] Session user_id set to: {st.session_state['user_id']}")
 
 if 'thread_id' not in st.session_state:
     st.session_state['thread_id'] = generate_thread_id()
@@ -231,8 +271,9 @@ if user_input:
         message_placeholder = st.empty()
 
         def stream_with_tool_tracking():
-            # Set the global thread_id for tool access
+            # Set both thread_id (for conversation) and user_id (for memory)
             backend._CURRENT_THREAD_ID = st.session_state['thread_id']
+            backend._CURRENT_USER_ID = st.session_state['user_id']
 
             tool_display = ""
             current_message = ""

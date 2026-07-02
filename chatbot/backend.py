@@ -1,5 +1,5 @@
 from langgraph.graph import StateGraph, START, END
-from typing import TypedDict, Annotated
+from typing import TypedDict, Annotated, List
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
@@ -13,6 +13,7 @@ import asyncio
 import threading
 from datetime import datetime
 from langsmith import traceable
+from pydantic import BaseModel, Field
 
 
 
@@ -59,8 +60,9 @@ _ASYNC_LOOP = asyncio.new_event_loop()
 _ASYNC_THREAD = threading.Thread(target=_ASYNC_LOOP.run_forever, daemon=True)
 _ASYNC_THREAD.start()
 
-# Global context to store current thread_id for tool access
+# Global context to store current thread_id and user_id for tool access
 _CURRENT_THREAD_ID = None
+_CURRENT_USER_ID = None  # Persistent user identifier for memory storage
 
 
 def _submit_async(coro):
@@ -200,41 +202,8 @@ def prepare_messages_with_trimming(messages: list[BaseMessage]) -> list[BaseMess
     return result
 
 
-# state of the workflow
-class ChatState(TypedDict):
-    messages: Annotated[list[BaseMessage], add_messages]
 
-def chat_node(state: ChatState):
-    messages = state['messages']
-
-    # Apply message trimming and summarization
-    trimmed_messages = prepare_messages_with_trimming(messages)
-
-    # Build system instruction
-    system_content = ("You have access to internet search tools and uploaded documents. Use them ONLY for: "
-                     "1) Current events or recent news (last few months), "
-                     "2) Information that changes frequently, "
-                     "3) Questions about uploaded documents - use retrieve_from_documents tool to search PDFs. "
-                     "use get_stock_price tool when user asks for stock prices. "
-                     "For general knowledge questions (history, basic facts, definitions), answer directly from your training data without using search tools.")
-
-    # Inject user memory context if available
-    try:
-        if _CURRENT_THREAD_ID:
-            memory_context = get_memory_context(_CURRENT_THREAD_ID)
-            if memory_context:
-                system_content += "\n\nUser Profile (remember these facts about the user):\n" + memory_context
-    except Exception as e:
-        print(f"[WARN] Could not inject user memories: {e}")
-
-    system_instruction = SystemMessage(content=system_content)
-    messages_with_system = [system_instruction] + trimmed_messages
-    response = llm.invoke(messages_with_system)
-    return {"messages": [response]}
-
-
-
-# all tools
+# ================================= all tools ============================================
 
 # 1.tool for internet search
 @tool
@@ -351,7 +320,7 @@ def init_user_memory_table():
 
 init_user_memory_table()
 
-# Checkpointer
+# defining Checkpointer for the graph
 checkpointer = SqliteSaver(conn = conn)
 
 
@@ -553,6 +522,102 @@ def get_memory_context(user_id):
         return ""
 
 
+# ======================= Memory Extraction Models =======================
+
+class MemoryItem(BaseModel):
+    text: str = Field(description="Atomic user memory")
+    is_new: bool = Field(description="True if new, false if duplicate")
+
+class MemoryDecision(BaseModel):
+    should_write: bool
+    memories: List[MemoryItem] = Field(default_factory=list)
+
+
+# ======================= Deduplication Logic =======================
+
+def is_memory_duplicate(new_memory_text, user_id, similarity_threshold=0.75):
+    """
+    Check if a new memory is a duplicate of existing memories using semantic similarity.
+    Returns True if duplicate, False if new.
+    """
+    try:
+        # Get existing memories for this user
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT memory_content, embedding FROM user_memory
+            WHERE user_id = ?
+        ''', (str(user_id),))
+        existing_memories = cursor.fetchall()
+
+        if not existing_memories:
+            return False  # No existing memories, so not a duplicate
+
+        # Generate embedding for new memory
+        new_embedding = embeddings_model.embed_query(new_memory_text)
+        new_embedding_array = np.array([new_embedding], dtype='float32')
+
+        # Check similarity with existing memories
+        for existing_content, embedding_bytes in existing_memories:
+            existing_embedding = np.frombuffer(embedding_bytes, dtype='float32').reshape(1, -1)
+
+            # Calculate L2 distance (lower = more similar)
+            distance = np.linalg.norm(new_embedding_array - existing_embedding)
+            similarity = 1 / (1 + distance)  # Convert distance to similarity score (0-1)
+
+            if similarity >= similarity_threshold:
+                print(f"[DEBUG] Memory duplicate detected: '{new_memory_text}' is similar to '{existing_content}' (similarity: {similarity:.2f})")
+                return True
+
+        return False
+    except Exception as e:
+        print(f"[WARN] Error checking memory duplicate: {e}")
+        return False
+
+
+def extract_user_memories(user_id, latest_message_text, existing_memories_text):
+    """
+    Extract new user memories from the latest message using LLM with structured output.
+    """
+    try:
+        memory_system_prompt = """You are responsible for updating and maintaining accurate user memory.
+
+TASK:
+- Review the user's latest message below
+- Extract user-specific info worth storing long-term (identity, preferences, skills, projects, goals)
+- For each item: set is_new=true ONLY if it's NEW info not in existing memories
+- Keep each memory as a short atomic sentence (max 15 words)
+- No speculation; only facts stated by the user
+- If nothing memory-worthy exists, set should_write=false"""
+
+        memory_user_message = f"""EXISTING MEMORIES:
+{existing_memories_text or "(empty)"}
+
+LATEST USER MESSAGE:
+{latest_message_text}
+
+Extract new facts from the latest message. Return structured output."""
+
+        # Create structured output extractor
+        memory_extractor = llm.with_structured_output(MemoryDecision)
+
+        # Extract memories with both system and user messages
+        decision: MemoryDecision = memory_extractor.invoke([
+            SystemMessage(content=memory_system_prompt),
+            HumanMessage(content=memory_user_message)
+        ])
+
+        print(f"[DEBUG] Memory extraction decision: should_write={decision.should_write}, memories={len(decision.memories)}")
+        for mem in decision.memories:
+            print(f"[DEBUG]   - '{mem.text}' (is_new={mem.is_new})")
+
+        return decision
+    except Exception as e:
+        print(f"[ERROR] Error extracting user memories: {e}")
+        import traceback
+        traceback.print_exc()
+        return MemoryDecision(should_write=False, memories=[])
+
+
 # ======================= RAG Functions =======================
 
 def get_faiss_path(thread_id):
@@ -711,6 +776,139 @@ def retrieve_from_documents(query: str, thread_id: str = None) -> str:
         return f"Error retrieving documents: {str(e)}"
 
 
+# ======================= Building workflow ==============================================
+
+
+# state of the workflow
+class ChatState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+
+
+# ======================= Remember Node (Memory Extraction) =======================
+
+def remember_node(state: ChatState):
+    """
+    Extract and store new user memories from the latest message.
+    This node runs BEFORE chat_node to capture user information.
+    """
+    try:
+        # Get current user_id (persistent across all chats)
+        user_id = _CURRENT_USER_ID
+        if not user_id:
+            print(f"[DEBUG] Remember node: No user_id (_CURRENT_USER_ID not set)")
+            return {}
+
+        print(f"[DEBUG] Remember node: Processing for user_id={user_id}")
+
+        # Get existing memories
+        existing_memories = get_memory_context(user_id)
+        print(f"[DEBUG] Existing memories: {existing_memories if existing_memories else '(empty)'}")
+
+        # Get latest user message (last HumanMessage)
+        latest_message_text = ""
+        for msg in reversed(state["messages"]):
+            if isinstance(msg, HumanMessage):
+                latest_message_text = msg.content
+                break
+
+        if not latest_message_text:
+            print(f"[DEBUG] Remember node: No user message found in state")
+            return {}
+
+        print(f"[DEBUG] Latest message: {latest_message_text[:100]}...")
+
+        # Extract memories from latest message
+        decision = extract_user_memories(user_id, latest_message_text, existing_memories)
+
+        print(f"[DEBUG] Extraction decision: should_write={decision.should_write}, count={len(decision.memories)}")
+
+        # Process extracted memories with deduplication
+        if decision.should_write and decision.memories:
+            for mem in decision.memories:
+                print(f"[DEBUG] Processing memory: '{mem.text}' (is_new={mem.is_new})")
+
+                if mem.is_new and mem.text.strip():
+                    # Double-check for duplicates before storing
+                    if not is_memory_duplicate(mem.text, user_id):
+                        # Store as 'fact' type memory
+                        success = add_user_memory(user_id, 'fact', mem.text)
+                        if success:
+                            print(f"[SUCCESS] ✅ New memory stored: '{mem.text}'")
+                        else:
+                            print(f"[ERROR] Failed to store memory: '{mem.text}'")
+                    else:
+                        print(f"[DEBUG] ⏭️  Skipped duplicate memory: '{mem.text}'")
+                else:
+                    print(f"[DEBUG] ⏭️  Skipped (is_new=False): '{mem.text}'")
+        else:
+            print(f"[DEBUG] No new memories to store")
+
+    except Exception as e:
+        print(f"[ERROR] Remember node failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    return {}
+
+
+def chat_node(state: ChatState):
+    messages = state['messages']
+
+    # Apply message trimming and summarization
+    trimmed_messages = prepare_messages_with_trimming(messages)
+
+    # Build comprehensive system prompt
+    system_content = """You are SurAI, a helpful, knowledgeable, and personable AI assistant.
+
+BEHAVIOR
+- Be helpful, honest, and conversational
+- Provide clear, structured answers with examples when relevant
+- Acknowledge limitations and uncertainties
+- Use a friendly but professional tone
+
+TOOLS
+- Internet Search: Only for current events, recent news, frequently changing info. Skip for general knowledge, history, definitions, or coding.
+- Document Retrieval: For uploaded PDFs — search documents before searching internet.
+- Stock Price: For current stock quotes/market data only. Not for analysis or advice.
+- Calculator: For mathematical calculations with large or complex numbers.
+
+MEMORY & PERSONALIZATION
+If user profile is available:
+- Address user by name when appropriate
+- Reference their skills, projects, or interests contextually
+- Tailor explanation depth to their expertise level
+- Build on previous context naturally
+
+RESPONSE STRUCTURE
+1. Direct answer
+2. Explanation/reasoning if helpful
+3. Examples or use cases if relevant
+4. Follow-up suggestions
+
+FOLLOW-UP QUESTIONS
+End each response with 2-3 relevant follow-up questions that build on the answer and help the user explore deeper. Format: "You might also want to know: • Q1? • Q2?"
+
+TONE
+- Technical users: precise, correct terminology, no over-explanation
+- General users: clear, use analogies, avoid jargon
+- Always adapt to user's communication style  
+"""
+
+    # Inject user memories into system message
+    try:
+        if _CURRENT_USER_ID:
+            memory_context = get_memory_context(_CURRENT_USER_ID)
+            if memory_context:
+                system_content += "\n\n=== YOUR PROFILE ===\nRemember these facts about the user:\n" + memory_context
+            else:
+                system_content += "\n\n=== YOUR PROFILE ===\n(No stored facts yet - learn about the user as you converse)"
+    except Exception as e:
+        print(f"[WARN] Could not inject user memories: {e}")
+
+    system_instruction = SystemMessage(content=system_content)
+    messages_with_system = [system_instruction] + trimmed_messages
+    response = llm.invoke(messages_with_system)
+    return {"messages": [response]}
 
 # ======================= Tool Binding =======================
 # Bind all tools to LLM and create tool node
@@ -723,11 +921,14 @@ tool_node = ToolNode(tools)
 graph = StateGraph(ChatState)
 
 # defining the nodes and edges
+graph.add_node("remember", remember_node)
 graph.add_node("chat_node", chat_node)
 graph.add_node("tools", tool_node)
 
-graph.add_edge(START, "chat_node")
-graph.add_conditional_edges('chat_node',tools_condition)
+# Workflow: START -> remember -> chat_node -> (conditional) tools -> chat_node -> END
+graph.add_edge(START, "remember")
+graph.add_edge("remember", "chat_node")
+graph.add_conditional_edges('chat_node', tools_condition)
 graph.add_edge('tools', 'chat_node')
 
 chatbot = graph.compile(checkpointer=checkpointer)
